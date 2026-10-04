@@ -364,8 +364,8 @@ test('native subscription routes keep HTTP additions disabled by default and for
 test('native feed appends HTTP nodes with verified TLS, matching country routes, and original WS entries intact', { timeout: 5000 }, async t => {
   const f = fixture(t, subscriptionUser), baseline = await nativeFeed(f), enabled = await nativeFeed(f, 'true');
   assert.equal(enabled.length, 72);
-  assert.deepEqual(enabled.slice(0, baseline.length), baseline, 'Existing WS URI order and all parameters are unchanged');
-  const added = enabled.slice(baseline.length).map(link => new URL(link));
+  assert.deepEqual(enabled.filter(link => baseline.includes(link)), baseline, 'Existing WS URI order and all parameters are unchanged');
+  const added = enabled.filter(link => !baseline.includes(link)).map(link => new URL(link));
   assert.equal(added.length, 18);
   const identities = new Set();
   for (const node of added) {
@@ -403,9 +403,9 @@ test('native feed appends HTTP nodes with verified TLS, matching country routes,
 test('native YAML appends unique HTTP names while preserving WS names, parameters, and country groups', { timeout: 5000 }, async t => {
   const f = fixture(t, subscriptionUser), baseline = await nativeYaml(f), enabled = await nativeYaml(f, 'true');
   assert.equal(enabled.proxies.length, 72);
-  assert.deepEqual(enabled.proxies.slice(0, baseline.proxies.length).map(node => node.block), baseline.proxies.map(node => node.block));
+  assert.deepEqual(enabled.proxies.filter(node => baseline.proxies.some(old => old.block === node.block)).map(node => node.block), baseline.proxies.map(node => node.block));
   assert.equal(new Set(enabled.proxies.map(node => node.name)).size, 72, 'All YAML proxy names remain unique');
-  const additions = enabled.proxies.slice(baseline.proxies.length);
+  const additions = enabled.proxies.filter(node => !baseline.proxies.some(old => old.block === node.block));
   assert.equal(additions.length, 18);
   const unquote = value => value?.startsWith('"') ? JSON.parse(value) : value;
   for (const node of additions) {
@@ -458,10 +458,10 @@ for (const [protocol, expectedWs, expectedHttp, schemes] of [
     const before = await nativeFeed(f), after = await nativeFeed(f, 'true');
     assert.equal(before.length, expectedWs);
     assert.equal(after.length, expectedWs + expectedHttp);
-    assert.deepEqual(after.slice(0, expectedWs), before);
-    assert(after.slice(expectedWs).every(link => schemes.includes(new URL(link).protocol)));
+    assert.deepEqual(after.filter(link => before.includes(link)), before);
+    assert(after.filter(link => !before.includes(link)).every(link => schemes.includes(new URL(link).protocol)));
     const oldYaml = await nativeYaml(f), newYaml = await nativeYaml(f, 'true');
     assert.equal(newYaml.proxies.length, expectedWs + expectedHttp);
-    assert.deepEqual(newYaml.proxies.slice(0, expectedWs).map(node => node.block), oldYaml.proxies.map(node => node.block));
+    assert.deepEqual(newYaml.proxies.filter(node => oldYaml.proxies.some(old => old.block === node.block)).map(node => node.block), oldYaml.proxies.map(node => node.block));
   });
 }

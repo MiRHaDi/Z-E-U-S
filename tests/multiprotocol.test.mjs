@@ -12,7 +12,7 @@ const payload = Buffer.from('TEST-APPLICATION-DATA');
 const request = new Request('https://worker.example/stream/PANEL_ZEUS/111111111111?loc=1');
 const env = { DB: { prepare(sql) { return { bind(...args) { return {
   async first() {
-    if (sql.includes('uuid LIKE')) return args[0] === '%111111111111' ? fixture : null;
+    if (sql.includes('substr(uuid, -12)')) return args[0] === '111111111111' ? fixture : null;
     if (sql.includes('trojan_hash')) return args[0] === hash ? fixture : null;
     return args[0] === uuid ? fixture : null;
   }, async run() {},

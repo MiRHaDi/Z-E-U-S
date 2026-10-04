@@ -132,3 +132,30 @@ a custom probe the bottleneck.
 References: [Workers protocols](https://developers.cloudflare.com/workers/reference/protocols/),
 [Xray XHTTP](https://github.com/XTLS/Xray-core/discussions/4113),
 [Node HTTP/2 flow control](https://nodejs.org/api/http2.html#http2sessionsetlocalwindowsizewindowsize).
+
+
+## Connection setup and subscription preferences
+
+Text and YAML exports list Smart profiles first, then keep each configured
+country's transports together. Route indices and account credentials are preserved.
+VLESS/Trojan WebSocket exports advertise up to 2560 bytes of early data through
+`Sec-WebSocket-Protocol`. The server bounds and validates that header, then uses
+the same ordered authentication and quota-checking queue as ordinary WS frames.
+Clients without early data remain supported; Shadowsocks export is unchanged.
+
+Append `?profile=compact` to a feed/YAML URL to export port 443, the first
+configured edge IP, and one already-enabled protocol (VLESS, then Trojan, then
+Shadowsocks). It retains configured country routes and enabled HTTP transports.
+Append `&client=standard` (or `?client=standard` by itself) to omit custom
+fragmentation, cipher and TLS-mask export parameters. Neither option changes
+stored account settings, usage or expiry. These are opt-in client preferences,
+not measured performance guarantees.
+
+Five lookup indexes match UUID, username and Trojan hash collations, including
+an exact 12-hex-character UUID suffix lookup for Shadowsocks. Legacy account
+backfills use a persistent settings marker committed in the same D1 batch, so
+later cold isolates do not repeatedly scan the users table. A failed transaction
+is retried on a later isolate. These optimizations do not increase D1 quotas or
+immediately restore a database that has already exhausted its daily allowance.
+Run `python tests/test-d1-query-plans.py` to verify the real index definitions
+against SQLite query plans with synthetic records.

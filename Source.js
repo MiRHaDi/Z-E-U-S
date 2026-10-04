@@ -626,8 +626,24 @@ const Router = {
 			} catch (e) { }
 			const httpTransports = env.HTTP_TRANSPORTS === "true" || env.HTTP_TRANSPORTS === true;
 			const smartRouting = zeusSmartEnabled(env);
-			if (isYamlPath) return await SubscriptionService.generateYaml(user, host, httpTransports, smartRouting);
-			return await SubscriptionService.generateText(user, host, httpTransports, smartRouting);
+			// Client-only export preferences never mutate account quotas or routes.
+			const exportUser = { ...user };
+			if (url.searchParams.get("client") === "standard") {
+				exportUser.advanced_frag = null;
+				exportUser.cipher_suites = null;
+				exportUser.tls_mask = null;
+				exportUser.frag_len = null;
+				exportUser.frag_int = null;
+			}
+			if (url.searchParams.get("profile") === "compact") {
+				const protocols = String(user.connection_type || "vless").toLowerCase();
+				exportUser.connection_type = protocols.includes("vless") ? "vless" : protocols.includes("trojan") ? "trojan" : protocols.includes("shadowsocks") ? "shadowsocks" : "vless";
+				exportUser.port = "443";
+				exportUser.auto_rotate_ip = 0;
+				exportUser.ips = String(user.ips || "").split(/[\s,]+/).filter(Boolean).slice(0, 1).join("\n");
+			}
+			if (isYamlPath) return await SubscriptionService.generateYaml(exportUser, host, httpTransports, smartRouting);
+			return await SubscriptionService.generateText(exportUser, host, httpTransports, smartRouting);
 		} catch (err) {
 			return new Response("Error building config: " + err.message, { status: 500 });
 		}
@@ -1537,12 +1553,23 @@ const DbService = {
 					}
 				}
 			} catch (e) { }
+			// Match collations exactly so authentication and subscription lookups use indexes.
+			for (const sql of [
+				"CREATE INDEX IF NOT EXISTS zeus_users_uuid ON users(uuid)",
+				"CREATE INDEX IF NOT EXISTS zeus_users_uuid_nocase ON users(uuid COLLATE NOCASE)",
+				"CREATE INDEX IF NOT EXISTS zeus_users_username_nocase ON users(username COLLATE NOCASE)",
+				"CREATE INDEX IF NOT EXISTS zeus_users_trojan_hash ON users(trojan_hash)",
+				"CREATE INDEX IF NOT EXISTS zeus_users_uuid_suffix ON users(substr(uuid, -12) COLLATE NOCASE)",
+			]) { try { await db.prepare(sql).run(); } catch (_) {} }
+			// These legacy table-wide updates must run once per database, not once per isolate.
 			try {
-				await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
-			} catch (e) { }
-			try {
-				await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
-			} catch (e) { }
+				const migration = await db.prepare("SELECT value FROM settings WHERE key = 'zeus_legacy_user_backfill_v1'").first();
+				if (!migration) await db.batch([
+					db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL"),
+					db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL"),
+					db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('zeus_legacy_user_backfill_v1', '1')"),
+				]);
+			} catch (_) {}
 		})();
 		await schemaPromise;
 		schemaEnsured = true;
@@ -2357,7 +2384,8 @@ const SubscriptionService = {
 		links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m1));
 		links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m2));
 		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
-		const plainContent = noise + links.join("\n");
+		links.sort((a, b) => zeusSubscriptionRouteRank(a) - zeusSubscriptionRouteRank(b));
+		const plainContent = noise + links.map(zeusWsEarlyDataUri).join("\n");
 		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
 		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
 		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
@@ -2505,6 +2533,8 @@ const SubscriptionService = {
 						           "    udp: true\n" +
 						           "    network: ws\n" +
 						           "    ws-opts:\n" +
+					           "      max-early-data: 2560\n" +
+					           "      early-data-header-name: Sec-WebSocket-Protocol\n" +
 						           "      path: " + proxy.currentDynPath + "\n" +
 						           "      headers:\n" +
 						           "        Host: " + host + "\n";
@@ -2526,6 +2556,8 @@ const SubscriptionService = {
 						           "    udp: true\n" +
 						           "    network: ws\n" +
 						           "    ws-opts:\n" +
+					           "      max-early-data: 2560\n" +
+					           "      early-data-header-name: Sec-WebSocket-Protocol\n" +
 						           "      path: " + proxy.currentDynPath + "\n" +
 						           "      headers:\n" +
 						           "        Host: " + host + "\n";
@@ -2570,6 +2602,10 @@ const SubscriptionService = {
 				}
 			}
 		}
+		const orderedProxies = yamlProxies.map((value, index) => ({ value, name: proxyNames[index] }))
+			.sort((a, b) => zeusSubscriptionRouteRank(a.value) - zeusSubscriptionRouteRank(b.value));
+		yamlProxies = orderedProxies.map(item => item.value);
+		proxyNames = orderedProxies.map(item => item.name);
 		let yamlStr = "dns:\n" +
 		              "  enable: true\n" +
 		              "  prefer-h3: false\n" +
@@ -3050,6 +3086,31 @@ async function handleZeusHttpTunnel(request, env, ctx, kind) {
 	}
 }
 
+// Keep every transport for one route together; Smart is always first.
+function zeusSubscriptionRouteRank(value) {
+  let text = value;
+  try { text = decodeURIComponent(value); } catch (_) {}
+  const route = text.match(/\/loc-(auto|\d+)(?=$|[/?;&\s"'\\])/);
+  return route ? (route[1] === "auto" ? 0 : Number(route[1]) + 1) : Number.MAX_SAFE_INTEGER;
+}
+function zeusWsEarlyDataUri(uri) {
+  const url = new URL(uri);
+  if ((url.protocol === "vless:" || url.protocol === "trojan:") && url.searchParams.get("type") === "ws") {
+    const path = url.searchParams.get("path") || "/";
+    url.searchParams.set("path", path + (path.includes("?") ? "&" : "?") + "ed=2560");
+    return url.toString();
+  }
+  return uri;
+}
+function zeusReadWsEarlyData(request) {
+  const encoded = request?.headers.get("Sec-WebSocket-Protocol");
+  if (!encoded) return null;
+  if (encoded.length > 3416 || !/^[A-Za-z0-9_-]+={0,2}$/.test(encoded)) throw new Error("Invalid early data");
+  const binary = atob(encoded.replace(/-/g, "+").replace(/_/g, "/"));
+  if (!binary.length || binary.length > 2560) throw new Error("Invalid early data size");
+  return Uint8Array.from(binary, c => c.charCodeAt(0)).buffer;
+}
+
 async function handlevIees(env, storedData = null, ctx = null, request = null, httpTransport = null) {
 	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
 	let clientIP = rawClientIP;
@@ -3065,6 +3126,11 @@ async function handlevIees(env, storedData = null, ctx = null, request = null, h
 				clientIP = parts.slice(0, 3).join(".") + ".0/24";
 			}
 		}
+	}
+	let earlyData = null;
+	if (!httpTransport) {
+		try { earlyData = zeusReadWsEarlyData(request); }
+		catch (_) { return new Response("Invalid WebSocket early data", { status: 400 }); }
 	}
 	const socketPair = httpTransport ? null : new WebSocketPair();
 	const [clientSock, serverSock] = httpTransport ? [null, httpTransport.socket] : Object.values(socketPair);
@@ -3420,7 +3486,9 @@ async function handlevIees(env, storedData = null, ctx = null, request = null, h
 						if (pathParts.length >= 4) userLookupKey = pathParts[3];
 					}
 					if (userLookupKey) {
-						user = await env.DB.prepare("SELECT * FROM users WHERE uuid LIKE ? AND is_active = 1").bind('%' + userLookupKey).first();
+						if (/^[0-9a-f]{12}$/i.test(userLookupKey)) {
+							user = await env.DB.prepare("SELECT * FROM users WHERE substr(uuid, -12) = ? COLLATE NOCASE AND is_active = 1").bind(userLookupKey).first();
+						}
 					}
 					if (!user || !String(user.connection_type).includes("shadowsocks")) {
 						serverSock.close();
@@ -3968,10 +4036,10 @@ async function handlevIees(env, storedData = null, ctx = null, request = null, h
 		wsChain = wsChain.then(task).catch(handleWsError);
 		return wsChain;
 	};
-	serverSock.addEventListener("message", (event) => {
+	const enqueueWsData = (data) => {
 		if (wsStopped || wsFailed) return;
-		if (typeof event.data === "string") return;
-		const size = event.data.byteLength || 0;
+		if (typeof data === "string") return;
+		const size = data.byteLength || 0;
 		const nextBytes = wsQueueBytes + size;
 		const nextItems = wsQueueItems + 1;
 		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
@@ -3984,9 +4052,10 @@ async function handlevIees(env, storedData = null, ctx = null, request = null, h
 			wsQueueBytes = Math.max(0, wsQueueBytes - size);
 			wsQueueItems = Math.max(0, wsQueueItems - 1);
 			if (wsFailed) return;
-			await processWsMessage(event.data);
+			await processWsMessage(data);
 		});
-	});
+	};
+	serverSock.addEventListener("message", event => enqueueWsData(event.data));
 	serverSock.addEventListener("close", () => {
 		if (httpTransport || (zeusSmartRequested(request) && zeusSmartEnabled(env))) {
 			try { remoteConnWrapper.socket?.close(); } catch (_) { }
@@ -4007,6 +4076,7 @@ async function handlevIees(env, storedData = null, ctx = null, request = null, h
 		handleWsError(err);
 	});
 	if (httpTransport) { httpTransport.start(); return await httpTransport.response(); }
+	if (earlyData) enqueueWsData(earlyData);
 	return new Response(null, { status: 101, webSocket: clientSock });
 }
 let CF_USAGE_CACHE = null;
